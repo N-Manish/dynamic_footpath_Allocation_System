@@ -20,7 +20,6 @@ def get_connection():
     return sqlite3.connect(DB_PATH)
 
 def get_lines():
-    """Return unique metro lines (trimmed)."""
     conn = get_connection()
     df = pd.read_sql(
         "SELECT DISTINCT TRIM(line_name) AS line_name FROM stations ORDER BY line_name;",
@@ -96,33 +95,24 @@ def draw_station_layout(station_name):
     if size == "big":
         ax.add_patch(plt.Rectangle((0.05, 0.65), 0.35, 0.12, fill=False))
         ax.text(0.225, 0.71, "Main Platforms", ha="center", va="center", fontsize=8)
-
         ax.add_patch(plt.Rectangle((0.6, 0.65), 0.35, 0.12, fill=False))
         ax.text(0.775, 0.71, "Branch Platforms", ha="center", va="center", fontsize=8)
-
         ax.add_patch(plt.Rectangle((0.1, 0.4), 0.8, 0.15, fill=False))
         ax.text(0.5, 0.475, "Large Concourse", ha="center", va="center", fontsize=8)
-
         ax.text(0.05, 0.45, "Entry Side", fontsize=7)
         ax.text(0.95, 0.45, "Exit Side", fontsize=7, ha="right")
-
     elif size == "medium":
         ax.add_patch(plt.Rectangle((0.2, 0.65), 0.6, 0.12, fill=False))
         ax.text(0.5, 0.71, "Platform Zone", ha="center", va="center", fontsize=8)
-
         ax.add_patch(plt.Rectangle((0.25, 0.4), 0.5, 0.15, fill=False))
         ax.text(0.5, 0.475, "Concourse", ha="center", va="center", fontsize=8)
-
         ax.text(0.1, 0.45, "Entry A", fontsize=7)
         ax.text(0.9, 0.45, "Exit C", fontsize=7, ha="right")
-
-    else:  # small
+    else:
         ax.add_patch(plt.Rectangle((0.25, 0.6), 0.5, 0.12, fill=False))
         ax.text(0.5, 0.66, "Platform", ha="center", va="center", fontsize=8)
-
         ax.add_patch(plt.Rectangle((0.3, 0.4), 0.4, 0.12, fill=False))
         ax.text(0.5, 0.46, "Concourse", ha="center", va="center", fontsize=8)
-
         ax.text(0.2, 0.42, "Entry", fontsize=7)
         ax.text(0.8, 0.42, "Exit", fontsize=7, ha="right")
 
@@ -178,13 +168,15 @@ if "locked_shortest_path" not in st.session_state:
     st.session_state.locked_shortest_path = None
 if "locked_best_path" not in st.session_state:
     st.session_state.locked_best_path = None
-# NEW: store frozen live table + baseline graphs
 if "live_routes" not in st.session_state:
     st.session_state.live_routes = None
 if "crowd_time_base" not in st.session_state:
     st.session_state.crowd_time_base = None
 if "station_load_base" not in st.session_state:
     st.session_state.station_load_base = {}
+# NEW: path assignment count (per station + start + end + path)
+if "path_assign_count" not in st.session_state:
+    st.session_state.path_assign_count = {}
 
 # =====================================================
 # STAGE 1 – Line & Station selection
@@ -197,9 +189,7 @@ if st.session_state.stage == "station_selection":
         st.error("No lines found in database. Please check 'stations' table.")
         st.stop()
 
-    # coloured line selection
-    label_map = {}
-    color_labels = []
+    label_map, color_labels = {}, []
     for ln in line_names:
         if "Purple" in ln:
             label = f"🟣 {ln}"
@@ -219,26 +209,18 @@ if st.session_state.stage == "station_selection":
         current_label = inv_map.get(st.session_state.selected_line, color_labels[0])
         default_index = color_labels.index(current_label)
 
-    selected_label = st.radio(
-        "🚇 Select Metro Line:",
-        color_labels,
-        index=default_index
-    )
+    selected_label = st.radio("🚇 Select Metro Line:", color_labels, index=default_index)
     selected_line = label_map[selected_label]
     st.session_state.selected_line = selected_line
 
     search_text = st.text_input("🔎 Search station in this line:", value="")
-
     full_station_list = get_stations(selected_line)
     if not full_station_list:
         st.error(f"No stations found for line: {selected_line}")
         st.stop()
 
     if search_text.strip():
-        station_list = [
-            s for s in full_station_list
-            if search_text.lower() in s.lower()
-        ]
+        station_list = [s for s in full_station_list if search_text.lower() in s.lower()]
         if not station_list:
             st.warning("No station matches your search. Showing all stations in this line.")
             station_list = full_station_list
@@ -252,15 +234,13 @@ if st.session_state.stage == "station_selection":
         if st.button("Next ➡️"):
             st.session_state.selected_station = station
             st.session_state.stage = "route_selection"
-            # reset frozen data when new station/route is chosen
             st.session_state.live_routes = None
             st.session_state.crowd_time_base = None
             st.session_state.station_load_base = {}
             st.rerun()
     with col2:
         st.markdown("#### Station Layout Preview")
-        layout_fig = draw_station_layout(station)
-        st.pyplot(layout_fig)
+        st.pyplot(draw_station_layout(station))
 
 # =====================================================
 # STAGE 2 – Source & Destination inside station
@@ -291,19 +271,24 @@ elif st.session_state.stage == "route_selection":
             st.session_state.selected_end = end_loc
 
             base_df = get_routes(station_name, start_loc, end_loc)
-
             if base_df.empty:
                 st.error("No predefined walking paths found for this source-destination pair in 'routes' table.")
             else:
                 st.session_state.base_routes = base_df
+
+                # shortest by distance (fixed)
                 shortest_idx = base_df["Base Distance (m)"].idxmin()
                 shortest = base_df.loc[shortest_idx]
                 st.session_state.locked_shortest_path = shortest.to_dict()
-                st.session_state.locked_best_path = shortest.to_dict()
-                # reset frozen data for this new route selection
+
+                # best path initially unknown – will be set using live time
+                st.session_state.locked_best_path = None
+
+                # reset per-route live data
                 st.session_state.live_routes = None
                 st.session_state.crowd_time_base = None
                 st.session_state.station_load_base = {}
+
                 st.session_state.stage = "results"
                 st.rerun()
 
@@ -315,35 +300,52 @@ elif st.session_state.stage == "route_selection":
 # STAGE 3 – Results (real-time graphs, frozen table)
 # =====================================================
 elif st.session_state.stage == "results":
-    # auto-refresh every 3 seconds - only graphs will change, not table
     st_autorefresh(interval=3000, key="auto_refresh_results")
 
     station_name = st.session_state.selected_station
     start_loc = st.session_state.selected_start
     end_loc = st.session_state.selected_end
     base_df = st.session_state.base_routes
-
     st.subheader(f"Step 3: Paths from '{start_loc}' → '{end_loc}' at {station_name}")
 
     if base_df is None or base_df.empty:
         st.error("⚠️ No routes found for this combination in DB.")
     else:
-        # ----------------- FROZEN TABLE LOGIC -----------------
-        # create live table ONCE and store in session
+        # ---------- FROZEN TABLE + BEST PATH (MIN LIVE TIME) ----------
         if st.session_state.live_routes is None:
             df_live = base_df.copy()
-            live_crowd = np.random.randint(20, 95, size=len(df_live))
-            df_live["Live Crowd (%)"] = [f"{c}%" for c in live_crowd]
+
+            live_crowd_list = []
+            for _, row in df_live.iterrows():
+                path_name = row["Path"]
+                base_random = np.random.randint(30, 70)
+                key = (station_name, start_loc, end_loc, path_name)
+                past_assignments = st.session_state.path_assign_count.get(key, 0)
+                crowd = base_random + past_assignments * 8   # +8% per previous assignment
+                crowd = int(np.clip(crowd, 5, 95))
+                live_crowd_list.append(crowd)
+
+            df_live["Live Crowd (%)"] = [f"{c}%" for c in live_crowd_list]
             df_live["Live Estimated Time (mins)"] = (
-                df_live["Base Time (mins)"] * (1 + (live_crowd / 100))
+                df_live["Base Time (mins)"] * (1 + (np.array(live_crowd_list) / 100))
             ).round(1)
+
             st.session_state.live_routes = df_live
+
+            # choose best path based on minimum live estimated time
+            best_idx = df_live["Live Estimated Time (mins)"].astype(float).idxmin()
+            locked_best = df_live.loc[best_idx].to_dict()
+            st.session_state.locked_best_path = locked_best
+
+            # increment assignment count for this chosen path
+            best_key = (station_name, start_loc, end_loc, locked_best["Path"])
+            st.session_state.path_assign_count[best_key] = \
+                st.session_state.path_assign_count.get(best_key, 0) + 1
         else:
             df_live = st.session_state.live_routes.copy()
-        # ------------------------------------------------------
+            locked_best = st.session_state.locked_best_path
+        # ---------------------------------------------------------------
 
-        # highlight BEST PATH row (bold + green)
-        locked_best = st.session_state.locked_best_path
         best_name = locked_best["Path"] if locked_best else None
 
         def highlight_best(row):
@@ -365,11 +367,12 @@ elif st.session_state.stage == "results":
             f"{locked_short['Base Time (mins)']} mins"
         )
 
-        # assigned path (same as shortest, fixed)
+        # assigned best path (min live time when user came)
         st.success(
-            f"✅ ASSIGNED USER PATH (FIXED): {locked_best['Path']} | "
+            f"✅ ASSIGNED USER PATH (FIXED – MIN LIVE TIME): {locked_best['Path']} | "
             f"Base Distance: {locked_best['Base Distance (m)']} m | "
-            f"Base Time: {locked_best['Base Time (mins)']} mins"
+            f"Base Time: {locked_best['Base Time (mins)']} mins | "
+            f"Initial Live Time: {locked_best['Live Estimated Time (mins)']} mins"
         )
 
         # path details
@@ -389,8 +392,7 @@ elif st.session_state.stage == "results":
 
         # station layout
         st.markdown("### 🗺 Station Layout (Schematic View)")
-        layout_fig = draw_station_layout(station_name)
-        st.pyplot(layout_fig)
+        st.pyplot(draw_station_layout(station_name))
 
         # ============ CROWD VARIATION PER PATH (BAR CHART) ============
         st.markdown("### 📊 Crowd Variation Over the Day (Per Path – Mild Live Update on Last Slot)")
@@ -400,12 +402,10 @@ elif st.session_state.stage == "results":
             "2-4 PM", "4-6 PM", "6-8 PM", "8-10 PM"
         ]
 
-        # Baseline created once and stored; only last time slot updates each refresh
         if st.session_state.crowd_time_base is None:
             crowd_time_base = {}
             for _, row in df_live.iterrows():
                 base_val = int(str(row["Live Crowd (%)"]).replace("%", ""))
-                # create a fixed pattern around base_val
                 pattern = base_val + np.random.randint(-15, 16, size=len(time_intervals))
                 pattern = np.clip(pattern, 0, 100)
                 crowd_time_base[row["Path"]] = pattern
@@ -414,10 +414,7 @@ elif st.session_state.stage == "results":
         crowd_matrix = {}
         for path, base_arr in st.session_state.crowd_time_base.items():
             arr = base_arr.copy()
-            # only modify LAST time slot slightly
-            arr[-1] = int(
-                np.clip(arr[-1] + np.random.randint(-5, 6), 0, 100)
-            )
+            arr[-1] = int(np.clip(arr[-1] + np.random.randint(-5, 6), 0, 100))
             crowd_matrix[path] = arr
 
         df_time = pd.DataFrame(crowd_matrix, index=time_intervals)
@@ -431,12 +428,10 @@ elif st.session_state.stage == "results":
         # ============ STATION-LEVEL PASSENGER LOAD (LINE CHART) ============
         st.markdown("### 🚦 Station-Level Passenger Load (Last Point Mildly Updating)")
 
-        # baseline per station created once, then only last value moves
         if station_name not in st.session_state.station_load_base:
             st.session_state.station_load_base[station_name] = simulate_station_load(station_name)
 
         df_load_base = st.session_state.station_load_base[station_name].copy()
-        # slightly adjust last time slot only
         last_idx = df_load_base.index[-1]
         df_load_base.loc[last_idx, "Passengers"] = max(
             50,
@@ -451,11 +446,11 @@ elif st.session_state.stage == "results":
         ax2.grid(True)
         st.pyplot(fig2)
 
+    # ---------- navigation buttons ----------
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔁 Choose Another Source/Destination"):
             st.session_state.stage = "route_selection"
-            # clear route-specific frozen data
             st.session_state.base_routes = None
             st.session_state.live_routes = None
             st.session_state.crowd_time_base = None
@@ -468,6 +463,7 @@ elif st.session_state.stage == "results":
                 "live_routes", "crowd_time_base"
             ]:
                 st.session_state[key] = None
+            # we *keep* path_assign_count so system remembers past users
             st.session_state.station_load_base = {}
             st.session_state.stage = "station_selection"
             st.rerun()
